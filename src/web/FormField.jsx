@@ -1,7 +1,15 @@
 /* global globalThis */
 import React, { useEffect, useMemo, useState } from 'react'
 import { MODES, TRAVEL_FORM_FIELDS } from '../shared/kissflow.js'
-import { formatMoney, searchAirports, searchCitiesLocal, searchFlights, todayIso } from '../shared/api.js'
+import {
+  DEFAULT_FROM,
+  DEFAULT_TO,
+  formatMoney,
+  searchAirports,
+  searchCitiesLocal,
+  searchFlights,
+  todayIso,
+} from '../shared/api.js'
 
 const COMPONENT_ID = 'refex-tms-travel-booking'
 
@@ -324,8 +332,8 @@ export function FormField(props) {
   const [domesticInternational, setDomesticInternational] = useState(restored?.domesticInternational || 'Domestic')
   const [beneficiary, setBeneficiary] = useState(restored?.beneficiary || 'Self')
   const [travelType, setTravelType] = useState(restored?.travelType || 'oneWay')
-  const [from, setFrom] = useState(restored?.fromAirport || null)
-  const [to, setTo] = useState(restored?.toAirport || null)
+  const [from, setFrom] = useState(restored?.fromAirport || DEFAULT_FROM)
+  const [to, setTo] = useState(restored?.toAirport || DEFAULT_TO)
   const [city, setCity] = useState(restored?.city || null)
   const [departureDate, setDepartureDate] = useState(restored?.departureDate || todayIso())
   const [returnDate, setReturnDate] = useState(restored?.returnDate || '')
@@ -394,32 +402,40 @@ export function FormField(props) {
 
   async function onSearchFlights() {
     if (!from?.code || !to?.code) {
-      setError('Select From and To airports.')
+      setError('Select From and To airports from the suggestions.')
       return
     }
     if (!departureDate) {
       setError('Departure date is required.')
       return
     }
-    if (travelType === 'roundTrip' && returnDate && returnDate <= departureDate) {
-      setError('Return date must be after departure.')
-      return
+    if (travelType === 'roundTrip') {
+      if (!returnDate) {
+        setError('Return date is required for round trip.')
+        return
+      }
+      if (returnDate <= departureDate) {
+        setError('Return date must be after departure.')
+        return
+      }
     }
     setSearching(true)
     setError('')
     setMessage('')
+    setSelectedFlight(null)
     try {
-      const body = {
+      const { options, meta } = await searchFlights({
         tripType: travelType === 'roundTrip' ? 'roundTrip' : 'oneWay',
+        from,
+        to,
+        depDate: departureDate,
+        arrDate: returnDate,
         fareClass: 'Economy',
-        segments: [{ from, to, date: departureDate }],
-        returnDate: travelType === 'roundTrip' ? returnDate : undefined,
-      }
-      const data = await searchFlights(body)
-      const options = data.options || data.flights || data.results || []
+        domesticInternational,
+      })
       setFlights(options)
-      setFlightSnapshot({ request: body, responseMeta: { count: options.length, uuid: data.uuid || '' } })
-      setMessage(options.length ? `${options.length} flights found.` : 'No flights returned.')
+      setFlightSnapshot(meta)
+      setMessage(options.length ? `${options.length} flights found.` : 'No flights returned for this route/date.')
     } catch (err) {
       setError(err.message || 'Flight search failed')
       setFlights([])
@@ -430,7 +446,7 @@ export function FormField(props) {
 
   function selectFlight(f) {
     setSelectedFlight(f)
-    writePayload({ selectedFlight: f, amount: f?.totalFare })
+    writePayload({ selectedFlight: f, amount: f?.totalFare, status: 'selected' })
   }
 
   function onSave() {
@@ -439,7 +455,7 @@ export function FormField(props) {
       return
     }
     if (isAir && !selectedFlight) {
-      setError('Select a flight (or search and pick one) before saving.')
+      setError('Search and select a flight before submitting.')
       return
     }
     if (isGround && (!from || !to || !departureDate)) {
@@ -454,11 +470,22 @@ export function FormField(props) {
       setError('Pickup, drop and date are required.')
       return
     }
-    writePayload()
+    writePayload({ status: 'ready_to_submit', submittedAt: new Date().toISOString() })
+    setMessage('Saved. Click Kissflow Submit on the parent form to start Travel Desk workflow.')
   }
 
   return (
-    <div style={styles.root}>
+    <div style={styles.root} className="rtb-root">
+      <style>{`
+        @keyframes rtb-fade-up { from { opacity:0; transform:translateY(10px);} to { opacity:1; transform:none;} }
+        @keyframes rtb-fly { 0%,100%{ transform:translateX(0);} 50%{ transform:translateX(4px);} }
+        .rtb-root { animation: rtb-fade-up .35s ease both; }
+        .rtb-mode { transition: transform .2s ease, box-shadow .2s ease, border-color .2s; }
+        .rtb-mode:hover { transform: translateY(-2px); }
+        .rtb-fly-ico { display:inline-block; animation: rtb-fly 1.6s ease-in-out infinite; }
+        .rtb-flight { transition: border-color .2s, background .2s, transform .15s; }
+        .rtb-flight:hover { transform: translateY(-1px); }
+      `}</style>
       <div style={styles.strip}>
         <span style={styles.avatar}>{initials(requester.name)}</span>
         <div style={{ flex: 1 }}>
@@ -476,6 +503,7 @@ export function FormField(props) {
             <button
               key={m.id}
               type="button"
+              className="rtb-mode"
               style={styles.modeCard(active, m.soft, m.accent)}
               onClick={() => {
                 setMode(m.id)
@@ -485,7 +513,14 @@ export function FormField(props) {
                 setError('')
               }}
             >
-              <div style={{ fontWeight: 800, color: m.accent, fontSize: 13 }}>{m.label}</div>
+              <div style={{ fontWeight: 800, color: m.accent, fontSize: 13 }}>
+                {m.id === 'air' || m.id === 'flightHotel' ? (
+                  <span className="rtb-fly-ico" style={{ marginRight: 6 }}>
+                    ✈
+                  </span>
+                ) : null}
+                {m.label}
+              </div>
               <div style={{ fontSize: 11, color: '#64748b', marginTop: 2 }}>{m.subtitle}</div>
             </button>
           )
@@ -575,13 +610,14 @@ export function FormField(props) {
                 (selectedFlight.uuid === f.uuid ||
                   (selectedFlight.flightNumber === f.flightNumber && selectedFlight.departureTime === f.departureTime))
               return (
-                <div key={f.uuid || i} style={styles.flightCard(selected)}>
+                <div key={f.uuid || f.id || i} className="rtb-flight" style={styles.flightCard(selected)}>
                   <div>
                     <div style={{ fontWeight: 700, fontSize: 13 }}>
                       {f.airlineName || f.airlineCode} {f.flightNumber || ''}
                     </div>
                     <div style={{ fontSize: 12, color: '#64748b' }}>
                       {f.sourceCityCode} {f.departureTime || ''} → {f.destinationCityCode} {f.arrivalTime || ''}
+                      {f.stops != null ? ` · ${f.stops === 0 ? 'Non-stop' : `${f.stops} stop`}` : ''}
                     </div>
                   </div>
                   <div style={{ textAlign: 'right' }}>
@@ -688,7 +724,7 @@ export function FormField(props) {
 
       <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 8 }}>
         <button type="button" style={styles.btn(true)} onClick={onSave}>
-          Save trip to form
+          Save & prepare submit
         </button>
       </div>
       {error && <div style={styles.error}>{error}</div>}
